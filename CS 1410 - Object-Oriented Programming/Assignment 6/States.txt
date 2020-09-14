@@ -1,0 +1,10 @@
+Utah	4
+Nevada	5
+California	6
+Oregon	7
+Utah	1
+California	1
+Nevada	1
+Nevada	1
+Oregon	1
+California	1
