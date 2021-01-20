@@ -1,0 +1,327 @@
+/*
+ * mm-naive.c - The least memory-efficient malloc package.
+ * 
+ * In this naive approach, a block is allocated by allocating a
+ * new page as needed.  A block is pure payload. There are no headers or
+ * footers.  Blocks are never coalesced or reused.
+ *
+ * NOTE TO STUDENTS: Replace this header comment with your own header
+ * comment that gives a high level description of your solution.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <unistd.h>
+#include <string.h>
+
+#include "mm.h"
+#include "memlib.h"
+
+/* always use 16-byte alignment */
+#define ALIGNMENT 16
+
+/* rounds up to the nearest multiple of ALIGNMENT */
+#define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~(ALIGNMENT-1))
+
+/* rounds up to the nearest multiple of mem_pagesize() */
+#define PAGE_ALIGN(size) (((size) + (mem_pagesize()-1)) & ~(mem_pagesize()-1))
+
+/* methods from macros.txt */
+
+// needed for OVERHEAD
+typedef size_t block_header;
+typedef size_t block_footer;
+
+// Total size of each block's overhead (header size + footer size)
+#define OVERHEAD (sizeof(block_header) + sizeof(block_footer))
+
+// Pointer to the block's header
+#define HDRP(bp) ((char *)(bp) - sizeof(block_header))
+
+// Pointer to the block's footer
+#define FTRP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)) - OVERHEAD)
+
+// Pointer to the next block
+#define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)))
+
+// Pointer to the previous block
+#define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE((char *)(bp) - OVERHEAD))
+
+// Get a pointer's value
+#define GET(p) (*(size_t *)(p))
+
+// Set a pointer's value
+#define PUT(p, val) (*(size_t *)(p) = (val))
+
+// Combines a size and an allocation bit
+#define PACK(size, alloc) ((size) | (alloc))
+
+// Gets the size from a header pointer
+#define GET_ALLOC(p) (GET(p) & 0x1)
+
+// Gets the allocation bit from a header pointer
+#define GET_SIZE(p) (GET(p) & ~0xF)
+
+// Maximum value of two values
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+/* Begin helper functions, some from macros.txt */
+
+// Setting a block as allocated, then updates backing structures as needed
+static void set_allocated(void *b, size_t size);
+
+// Requests more memory through mem_map, then updates backing structures as needed
+static void extend(size_t s);
+
+// Coalesces a freed block together
+static void* coalesce(void *bp);
+
+// Adding a node to the explicit free list
+static void addNode(void *bp);
+
+// Deleting a node from the explicit free list
+static void deleteNode(void *bp);
+
+/* End helper functions */
+
+// Node struct for the explicit free list
+typedef struct node{
+  struct node* previousNode;
+  struct node* nextNode;
+}node;
+
+/* Begin added globals */
+
+// Pointer to the first free node in the explicit free list, helps with addition/deletion
+void *current_avail = NULL;
+int current_avail_size = 0;
+static node* firstFreeNode;
+
+/* End added globals */
+
+/* 
+ * mm_init - initialize the malloc package.
+ */
+int mm_init(void)
+{
+  current_avail = NULL;
+  current_avail_size = 0;
+  firstFreeNode = NULL;
+  
+  return 0;
+}
+
+/* 
+ * mm_malloc - Allocate a block by using bytes from current_avail,
+ *     grabbing a new page if necessary.
+ */
+void *mm_malloc(size_t size)
+{
+  int newsize = ALIGN(MAX(size, sizeof(node*)) + OVERHEAD);
+
+  if(firstFreeNode == NULL)
+    {
+      extend(newsize * 128);
+    }
+
+  node* currentFree = firstFreeNode;
+
+  while(1)
+    {
+      if(GET_SIZE(HDRP(currentFree)) >= newsize)
+	{
+	  set_allocated(currentFree, newsize);
+	  return (void *)currentFree;
+	}
+
+      if(currentFree->nextNode == NULL)
+	{
+	  extend(newsize * 128);
+	  currentFree = firstFreeNode;
+	}
+
+      else
+	{
+	  currentFree = currentFree->nextNode;
+	}
+    }
+}
+
+/*
+ * mm_free - Freeing a block does nothing.
+ */
+void mm_free(void *ptr)
+{
+  size_t blockSize = GET_SIZE(HDRP(ptr));
+
+  PUT(HDRP(ptr), PACK(blockSize, 0));
+  PUT(FTRP(ptr), PACK(blockSize, 0));
+ 
+  void* coalescedFree = coalesce(ptr);
+
+  void* checkHeader = PREV_BLKP(coalescedFree);
+  void* checkFooter = NEXT_BLKP(coalescedFree);
+
+  size_t checkHeaderSize = GET_SIZE(HDRP(checkHeader));
+  size_t checkHeaderAlloc = GET_ALLOC(HDRP(checkHeader));
+  size_t checkFooterSize = GET_SIZE(HDRP(checkFooter));
+  size_t checkFooterAlloc = GET_ALLOC(HDRP(checkFooter));
+
+  if(checkHeaderSize == 16 && checkHeaderAlloc == 1 && checkFooterSize == 0 && checkFooterAlloc == 1)
+    {
+      deleteNode(coalescedFree);
+      mem_unmap(coalescedFree-32, GET_SIZE(HDRP(coalescedFree))+32);
+    }
+}
+
+static void set_allocated(void *b, size_t size)
+{
+  size_t freeBlockSize = GET_SIZE(HDRP(b));
+
+  PUT(HDRP(b), PACK(size, 1));
+  PUT(FTRP(b), PACK(size, 1));
+
+  deleteNode(b);
+
+  size_t remainingFreeSize = freeBlockSize - size;
+
+  if(remainingFreeSize >= 32)
+    {
+      char *p = (char *)b;
+      PUT(HDRP(NEXT_BLKP(b)), PACK(remainingFreeSize, 0));
+      PUT(FTRP(NEXT_BLKP(b)), PACK(remainingFreeSize, 0));
+
+      addNode(p+size);
+    }
+
+  else
+    {
+      PUT(HDRP(b), PACK(freeBlockSize, 1));
+      PUT(FTRP(b), PACK(freeBlockSize, 1));
+    }
+}
+
+static void extend(size_t size)
+{
+  current_avail_size = PAGE_ALIGN(size);
+  current_avail = mem_map(current_avail_size);
+
+  char *p = (char *)current_avail;
+
+  PUT(p+8, PACK(16, 1));
+  PUT(p+16, PACK(16, 1));
+  PUT(p+24, PACK(current_avail_size-32, 0));
+  PUT(FTRP(p+32), PACK(current_avail_size-32, 0));
+  PUT(FTRP(p+32)+8, PACK(0, 1));
+
+  addNode(p+32);
+}
+
+static void* coalesce(void *bp)
+{
+  void* prevBlock = PREV_BLKP(bp);
+  void* nextBlock = NEXT_BLKP(bp);
+  size_t prev_alloc = GET_ALLOC(HDRP(prevBlock));
+  size_t next_alloc = GET_ALLOC(HDRP(nextBlock));
+
+  if(prev_alloc && next_alloc)
+    {
+      addNode(bp);
+      return bp;
+    }
+
+  else if(prev_alloc && !next_alloc)
+    {
+      size_t size = GET_SIZE(HDRP(bp)) + GET_SIZE(HDRP(nextBlock));
+      PUT(HDRP(bp), PACK(size, 0));
+      PUT(FTRP(nextBlock), PACK(size, 0));
+
+      deleteNode(nextBlock);
+      addNode(bp);
+
+      return bp;
+    }
+
+  else if(!prev_alloc && next_alloc)
+    {
+      size_t size = GET_SIZE(HDRP(bp)) + GET_SIZE(HDRP(prevBlock));
+      PUT(HDRP(prevBlock), PACK(size, 0));
+      PUT(FTRP(bp), PACK(size, 0));
+
+      return prevBlock;
+    }
+
+  else if(!prev_alloc && !next_alloc)
+    {
+      size_t size = GET_SIZE(HDRP(bp)) + GET_SIZE(HDRP(prevBlock)) + GET_SIZE(HDRP(nextBlock));
+      PUT(HDRP(prevBlock), PACK(size, 0));
+      PUT(FTRP(nextBlock), PACK(size, 0));
+
+      deleteNode(nextBlock);
+      
+      return prevBlock;
+    }
+
+  return bp;
+}
+
+static void addNode(void *bp)
+{
+  node* newNode = (node *)bp;
+
+  if(firstFreeNode != NULL)
+    {
+      firstFreeNode->previousNode = newNode;
+      newNode->nextNode = firstFreeNode;
+      newNode->previousNode = NULL;
+      firstFreeNode = newNode;
+    }
+
+  else
+    {
+      firstFreeNode = newNode;
+      firstFreeNode->previousNode = NULL;
+      firstFreeNode->nextNode = NULL;
+    }
+}
+
+static void deleteNode(void *bp)
+{
+  node* nodeToDelete = (node *)bp;
+
+  node* deletePreviousNode = nodeToDelete->previousNode;
+  node* deleteNextNode = nodeToDelete->nextNode;
+
+  if(nodeToDelete == firstFreeNode)
+    {
+      if(firstFreeNode->nextNode != NULL)
+	{
+	  firstFreeNode = firstFreeNode->nextNode;
+	  firstFreeNode->previousNode = NULL;
+	} 
+
+      else
+	{
+	  firstFreeNode->previousNode = NULL;
+	  firstFreeNode->nextNode = NULL;
+	  firstFreeNode = NULL;
+	}
+    }
+
+  else if(deleteNextNode == NULL && deletePreviousNode != NULL)
+    {
+      deletePreviousNode->nextNode = NULL;
+    } 
+
+  else if(deletePreviousNode == NULL && deleteNextNode != NULL)
+    {
+      firstFreeNode = deleteNextNode;
+      firstFreeNode->previousNode = NULL;
+    }
+
+  else if(deletePreviousNode != NULL && deleteNextNode != NULL)
+    {
+      deleteNextNode->previousNode = deletePreviousNode;
+      deletePreviousNode->nextNode = deleteNextNode;
+    }
+}
